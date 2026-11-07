@@ -13,6 +13,7 @@ import pytest
 
 pytest.importorskip("maubot")
 from aiohttp import web  # noqa: E402
+from maubot.plugin_server import PluginWebApp, PrefixResource  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import sbx_approval  # noqa: E402
@@ -62,20 +63,33 @@ def make_plugin():
 
 @pytest.fixture
 async def setup(aiohttp_client):
+    """Routed the way maubot 0.6.0 routes plugin web apps (maubot/server.py, handle_plugin_path): a PrefixResource
+    for the plugin base path, and the instance prefix cut off the path before the plugin's PluginWebApp sees it.
+    The routes come from the plugin's own @web decorators."""
     plugin = make_plugin()
+    sub = PluginWebApp()
+    for name in dir(plugin):
+        for method, path, kwargs in getattr(getattr(plugin, name), "__mb_web_handler__", []):
+            sub.add_route(method=method, path=path, handler=getattr(plugin, name), **kwargs)
+    instance_path = PREFIX + "/"
+
+    async def handle_plugin_path(request):
+        if request.path.startswith(instance_path):
+            request = request.clone(rel_url=request.rel_url.with_path(
+                request.rel_url.path[len(instance_path) - 1:]).with_query(request.query_string))
+            return await sub.handle(request)
+        return web.Response(status=404)
+
     app = web.Application()
-    sub = web.Application()
-    sub.router.add_post("/ask", plugin.ask)
-    sub.router.add_get("/answer/{qid}", plugin.answer)
-    sub.router.add_post("/close/{qid}", plugin.close)
-    sub.router.add_post("/link", plugin.link)
-    app.add_subapp(PREFIX, sub)
+    resource = PrefixResource("/_matrix/maubot/plugin")
+    resource.add_route("*", handle_plugin_path)
+    app.router.register_resource(resource)
     return plugin, await aiohttp_client(app)
 
 
 async def call(client, method, path, data=None, secret=SECRET):
     body = json.dumps(data).encode() if data is not None else b""
-    headers = core.sign_request(secret.encode(), method, PREFIX + path, body)
+    headers = core.sign_request(secret.encode(), method, path, body)  # signed: the path below the instance
     resp = await client.request(method, PREFIX + path, data=body, headers=headers)
     raw = await resp.read()
     signed = core.check_response(SECRET.encode(), headers["X-Sbx-Nonce"], resp.status, raw,
@@ -110,7 +124,7 @@ async def test_wrong_secret_and_replay(setup):
     status, body, signed = await call(client, "POST", "/ask", QUESTION, secret="x" * 40)
     assert (status, body, signed) == (401, {"error": "bad signature"}, False)
     assert plugin.client.sent == []
-    headers = core.sign_request(SECRET.encode(), "GET", PREFIX + "/answer/q1", b"")
+    headers = core.sign_request(SECRET.encode(), "GET", "/answer/q1", b"")
     first = await client.get(PREFIX + "/answer/q1", headers=headers)
     second = await client.get(PREFIX + "/answer/q1", headers=headers)
     assert first.status == 404 and second.status == 401
@@ -133,3 +147,12 @@ async def test_no_secret(setup):
     plugin.config["secret"] = "short"
     status, _, signed = await call(client, "POST", "/ask", QUESTION)
     assert (status, signed) == (503, False)
+
+
+async def test_full_path_signature_is_refused(setup):
+    """The path maubot hands the plugin has no instance prefix; a caller signing the full URL path fails."""
+    plugin, client = setup
+    body = json.dumps(QUESTION).encode()
+    headers = core.sign_request(SECRET.encode(), "POST", PREFIX + "/ask", body)
+    resp = await client.post(PREFIX + "/ask", data=body, headers=headers)
+    assert resp.status == 401 and (await resp.json()) == {"error": "bad signature"}

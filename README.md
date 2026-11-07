@@ -45,7 +45,7 @@ The answer tokens never reach Matrix: the poll gets random answer ids, and only 
 ```text
 sbx-approval-request
 <METHOD>
-<full request path, e.g. /_matrix/maubot/plugin/sbx/answer/q1>
+<path below the instance, e.g. /answer/q1 — maubot strips /_matrix/maubot/plugin/<instance> before the plugin sees it>
 <X-Sbx-Time>
 <X-Sbx-Nonce>
 <hex SHA-256 of the body>

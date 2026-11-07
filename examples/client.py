@@ -14,16 +14,15 @@ import secrets
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
 
 def call(base: str, secret: bytes, method: str, path: str, data=None) -> tuple[int, dict]:
     body = json.dumps(data).encode() if data is not None else b""
     url = base.rstrip("/") + path
-    full_path = urllib.parse.urlsplit(url).path
+    # Signed is the path below the instance (e.g. /answer/q1): maubot strips its prefix before the plugin sees it.
     ts, nonce = str(int(time.time())), secrets.token_urlsafe(24)
-    message = "\n".join(["sbx-approval-request", method, full_path, ts, nonce, hashlib.sha256(body).hexdigest()])
+    message = "\n".join(["sbx-approval-request", method, path, ts, nonce, hashlib.sha256(body).hexdigest()])
     request = urllib.request.Request(url, data=body if method != "GET" else None, method=method, headers={
         "Content-Type": "application/json", "X-Sbx-Time": ts, "X-Sbx-Nonce": nonce,
         "X-Sbx-Mac": hmac.new(secret, message.encode(), hashlib.sha256).hexdigest()})
