@@ -29,6 +29,16 @@ ADR 0024 ("Approvals and links of the agent sandbox through Matrix").
 Built on NixOS with `fetchFromGitHub` and **pinned to a commit hash**; a change here runs only after the pin is changed
 on the host.
 
+## Avatar
+
+[`assets/avatar.jpg`](assets/avatar.jpg) is the bot account's avatar (256×256, uploaded in the maubot UI on the client).
+Generated 2026-11-07 with FLUX 3 Image Klein distilled (ComfyUI, 1024×1024, 16 steps, cfg 1, prompt upsampler on,
+seed 856283351522516), then cropped to the tile and scaled down. Prompt:
+
+```text
+A minimalist flat vector app icon, centered on a plain solid background: a small friendly robot head inside a square sandbox frame, with a large green check mark and a red cross badge at its side, symbolising approval. Bold simple shapes, thick clean outlines, two to three colours (deep teal, warm white, signal green), high contrast, no text, no gradients, no small details, generous empty margin around the subject so it survives a circular crop, readable at 32 pixels.
+```
+
 ## License
 
 [Unlicense](LICENSE) — public domain.
