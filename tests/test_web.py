@@ -136,6 +136,10 @@ async def test_close_and_link(setup):
     assert await call(client, "POST", "/close/q1", {"label": "Einmal"}) == (200, {"closed": True}, True)
     assert plugin.client.sent[-1][2]["body"] == "Beantwortet über das Telefon: Einmal"
     assert await call(client, "GET", "/answer/q1") == (200, {"state": "closed"}, True)
+    assert await call(client, "POST", "/close/q1", {}) == (200, {"closed": False}, True)
+    await call(client, "POST", "/ask", dict(QUESTION, id="q2"))
+    assert await call(client, "POST", "/close/q2", {"reason": "replaced"}) == (200, {"closed": True}, True)
+    assert plugin.client.sent[-1][2]["body"] == "Ersetzt durch eine neue Frage"
     status, _, signed = await call(client, "POST", "/link", {"text": "Bild <b>", "url": "https://x.example/p?a=1&b=2"})
     assert (status, signed) == (201, True)
     html = plugin.client.sent[-1][2]["formatted_body"]

@@ -8,8 +8,8 @@ one random token per answer; the plugin starts a poll in the room, takes the **f
 ends the poll, and returns the token of the chosen answer. A question nobody answers ends as expired after a timeout.
 It can also post plain links (shared or published files) into the same room.
 
-**Status:** written and tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
-mautrix 0.21.1 with a fake Matrix client); not yet run in maubot. The design and the reasons behind it are recorded in
+**Status:** in use with maubot 0.6.0; tested off-line (logic, and the HTTP endpoints of the real plugin class against
+maubot 0.6.0 / mautrix 0.21.1 with a fake Matrix client, routed as maubot routes them). The design and the reasons behind it are recorded in
 the homelab repository's ADR 0024 ("Approvals and links of the agent sandbox through Matrix").
 
 ## Design in brief
@@ -20,7 +20,7 @@ the homelab repository's ADR 0024 ("Approvals and links of the agent sandbox thr
   Votes from anyone else, and any vote after the first, change nothing.
 - **HTTP API** through maubot's plugin web app (`/_matrix/maubot/plugin/<instance>/…`):
   `POST /ask` (question id, text, one token per answer), `GET /answer/<id>` (the chosen token, or still open / expired),
-  `POST /link` (a message with a link).
+  `POST /close/<id>` (the answer came elsewhere), `POST /link` (a message with a link).
 - **Signed with HMAC**, requests and responses, over a shared secret with timestamp and nonce. The secret never crosses
   the wire, so someone who can read the LAN traffic cannot forge an answer.
 - **Nothing site-specific in this repository.** Secret, room and user live in maubot's instance config.
@@ -34,7 +34,7 @@ an unsigned, wrongly signed, stale or replayed request gets `401` without a sign
 |---|---|---|
 | `POST /ask` | `{"id", "question", "answers": [{"label", "token"}, …], "timeout"?}` — 2 to 8 answers, labels ≤ 40 characters, tokens 16 to 128 of `[A-Za-z0-9_-]`, timeout 30 to 3600 s (default from the config) | `201 {"id"}`; `409` id used, `429` 50 open questions, `502` poll not sent |
 | `GET /answer/<id>` | — | `200 {"state": "open" \| "expired" \| "closed"}` or `{"state": "answered", "token"}`; `404` unknown (also after a maubot restart: questions live in memory) |
-| `POST /close/<id>` | `{"label"?}` | `200 {"closed": bool}` — the caller got its answer elsewhere; the poll ends as "Beantwortet über das Telefon" |
+| `POST /close/<id>` | `{"label"?, "reason"?}` | `200 {"closed": bool}` — the caller got its answer elsewhere; the poll ends as "Beantwortet über das Telefon" (with the label), or with `"reason": "replaced"` as "Ersetzt durch eine neue Frage" |
 | `POST /link` | `{"text", "url"}` — `http(s)` only | `201 {"sent": true}` |
 
 The answer tokens never reach Matrix: the poll gets random answer ids, and only the plugin maps them back.

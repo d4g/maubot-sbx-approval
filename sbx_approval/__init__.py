@@ -119,10 +119,12 @@ class SbxApproval(Plugin):
             data = self._json(body) if body else {}
             label = data.get("label") if isinstance(data, dict) else None
             label = label if isinstance(label, str) and len(label) <= core.LABEL_MAX else None
+            replaced = isinstance(data, dict) and data.get("reason") == "replaced"
             async with self.lock:
                 question = self.questions.close(request.match_info["qid"], label, time.time())
             if question is not None:
-                await self._end(question, "Beantwortet über das Telefon" + (f": {label}" if label else ""))
+                await self._end(question, "Ersetzt durch eine neue Frage" if replaced
+                                else "Beantwortet über das Telefon" + (f": {label}" if label else ""))
             return self._reply(nonce, 200, {"closed": question is not None})
         except core.Refused as error:
             return self._refused(error)
