@@ -184,3 +184,101 @@ def test_link_urls(url, ok):
     else:
         with pytest.raises(core.Refused):
             core.link_text({"text": "x", "url": url})
+
+
+# --- detail and strict ---------------------------------------------------------------------------------------------
+
+def ask_strict(qs, qid="s1", detail="automation:\n  - id: x\n", now=T0):
+    data = {"id": qid, "question": "Darf ha-config-apply plan-1 laufen?", "detail": detail,
+            "answers": [{"label": "Ablehnen", "token": "a" * 20}], "strict": {"token": "d" * 20}}
+    return qs.add(data, 900, now)
+
+
+def test_code_is_lowercase_and_digits_without_lookalikes():
+    for _ in range(200):
+        code = core.make_code()
+        assert len(code) == core.CODE_LEN and set(code) <= set(core.CODE_ALPHABET)
+    assert not set("0o1l") & set(core.CODE_ALPHABET)
+
+
+def test_strict_needs_only_the_refusal_and_a_distinct_token():
+    qs = core.Questions()
+    q = ask_strict(qs)
+    assert q.code and q.code_token == "d" * 20 and q.code_label == "Freigegeben"
+    with pytest.raises(core.Refused, match="repeated answer token"):
+        qs.add({"id": "s2", "question": "x", "answers": [{"label": "Ablehnen", "token": "d" * 20}],
+                "strict": {"token": "d" * 20}}, 900, T0)
+    with pytest.raises(core.Refused, match="need 2 to 8"):
+        qs.add({"id": "s3", "question": "x", "answers": [{"label": "Ablehnen", "token": "a" * 20}]}, 900, T0)
+
+
+def test_detail_limits():
+    qs = core.Questions()
+    with pytest.raises(core.Refused) as error:
+        ask_strict(qs, detail="x" * (core.DETAIL_MAX + 1))
+    assert error.value.status == 413
+    with pytest.raises(core.Refused, match="bad detail"):
+        ask_strict(qs, detail="  ")
+    # Within DETAIL_MAX but escaping blows the HTML up past one event: refused before any poll is sent.
+    with pytest.raises(core.Refused, match="too long for one Matrix event"):
+        ask_strict(qs, qid="s4", detail="<" * core.DETAIL_MAX)
+    assert "s4" not in qs.items
+
+
+def test_thread_content_has_detail_then_code_and_no_token():
+    qs = core.Questions()
+    q = ask_strict(qs, detail="a: <b>")
+    content = core.thread_content(q, "$poll")
+    assert content["m.relates_to"]["rel_type"] == "m.thread" and content["m.relates_to"]["event_id"] == "$poll"
+    assert content["body"].index("a: <b>") < content["body"].index(q.code)
+    assert "&lt;b&gt;" in content["formatted_body"]
+    assert "d" * 20 not in json.dumps(content) and "a" * 20 not in json.dumps(content)
+    assert core.STRICT_HINT in core.poll_start_content(q)[core.POLL_START]["question"]["body"]
+
+
+@pytest.mark.parametrize("typed", ["{code}", "  {code} ", "{upper}", "> <@sbx:x> Freigeben\n\n{code}"])
+def test_right_code_approves(typed):
+    qs = core.Questions()
+    q = ask_strict(qs)
+    qs.bind(q, "$poll")
+    text = typed.format(code=q.code, upper=q.code.capitalize())
+    question, ok = qs.code_reply("$poll", APPROVER, text, APPROVER, T0 + 5)
+    assert ok and qs.answer("s1") == {"state": "answered", "token": "d" * 20}
+
+
+def test_wrong_code_refuses_and_there_is_no_second_attempt():
+    qs = core.Questions()
+    q = ask_strict(qs)
+    qs.bind(q, "$poll")
+    question, ok = qs.code_reply("$poll", APPROVER, "warum?", APPROVER, T0 + 5)
+    assert not ok and qs.answer("s1") == {"state": "answered", "token": "a" * 20}
+    assert qs.code_reply("$poll", APPROVER, q.code, APPROVER, T0 + 6) is None
+    assert qs.answer("s1")["token"] == "a" * 20
+
+
+def test_code_reply_ignores_others_late_and_plain_questions():
+    qs = core.Questions()
+    q = ask_strict(qs)
+    qs.bind(q, "$poll")
+    assert qs.code_reply("$poll", "@other:x", q.code, APPROVER, T0 + 5) is None
+    assert qs.code_reply("$other", APPROVER, q.code, APPROVER, T0 + 5) is None
+    assert qs.code_reply("$poll", APPROVER, q.code, APPROVER, T0 + 901) is None
+    assert qs.answer("s1") == {"state": "open"}
+    plain = ask(qs, qid="p1")
+    qs.bind(plain, "$plain")
+    assert qs.code_reply("$plain", APPROVER, "abc", APPROVER, T0 + 5) is None
+
+
+def test_refusal_by_poll_still_works_on_strict():
+    qs = core.Questions()
+    q = ask_strict(qs)
+    qs.bind(q, "$poll")
+    assert qs.vote("$poll", APPROVER, [q.answers[0].id], APPROVER, T0 + 5) is not None
+    assert qs.answer("s1")["token"] == "a" * 20
+    assert qs.code_reply("$poll", APPROVER, q.code, APPROVER, T0 + 6) is None
+
+
+def test_thread_root():
+    assert core.thread_root({"m.relates_to": {"rel_type": "m.thread", "event_id": "$r"}}) == "$r"
+    assert core.thread_root({"m.relates_to": {"rel_type": "m.reference", "event_id": "$r"}}) is None
+    assert core.thread_root({}) is None

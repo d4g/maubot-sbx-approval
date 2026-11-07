@@ -16,7 +16,8 @@ from . import core
 POLL_START = EventType.find(core.POLL_START, EventType.Class.MESSAGE)
 POLL_RESPONSE = EventType.find(core.POLL_RESPONSE, EventType.Class.MESSAGE)
 POLL_END = EventType.find(core.POLL_END, EventType.Class.MESSAGE)
-BODY_MAX = 16 * 1024
+# A question with a detail of up to core.DETAIL_MAX, plus the rest of the request.
+BODY_MAX = core.DETAIL_MAX + 8 * 1024
 TICK = 10
 
 
@@ -100,6 +101,16 @@ class SbxApproval(Plugin):
                     self.log.exception("could not send the poll for %s", question.qid)
                     return self._reply(nonce, 502, {"error": "could not send the poll"})
                 self.questions.bind(question, event_id)
+                if question.detail or question.code:
+                    try:
+                        await self.client.send_message_event(self.config["room_id"], EventType.ROOM_MESSAGE,
+                                                             core.thread_content(question, event_id))
+                    except Exception:
+                        # Without the thread a strict question cannot be approved and a detail is not shown: end it.
+                        self.log.exception("could not send the thread of %s", question.qid)
+                        self.questions.close(question.qid, None, time.time())
+                        await self._end(question, "Abgebrochen: Details konnten nicht gesendet werden")
+                        return self._reply(nonce, 502, {"error": "could not send the thread"})
             return self._reply(nonce, 201, {"id": question.qid})
         except core.Refused as error:
             return self._refused(error)
@@ -159,6 +170,34 @@ class SbxApproval(Plugin):
             self.log.info("question %s answered: %s", question.qid, question.label)
             await self._end(question, f"Antwort: {question.label}")
 
+    @event.on(EventType.ROOM_MESSAGE)
+    async def on_message(self, evt) -> None:
+        """A reply in the thread of a strict question: the code, or anything else as the refusal."""
+        if evt.room_id != self.config["room_id"] or evt.sender == self.client.mxid:
+            return
+        content = evt.content.serialize() if hasattr(evt.content, "serialize") else dict(evt.content)
+        root = core.thread_root(content)
+        if root is None:
+            return
+        marker = evt.get("mautrix") or {}
+        if not marker.get("was_encrypted"):
+            self.log.warning("ignored an unencrypted thread message from %s", evt.sender)
+            return
+        body = content.get("body")
+        async with self.lock:
+            result = self.questions.code_reply(root, evt.sender, body if isinstance(body, str) else "",
+                                               self.config["approver"], time.time())
+        if result is None:
+            return
+        question, ok = result
+        self.log.info("question %s answered by code: %s", question.qid, "right" if ok else "wrong")
+        try:
+            await self.client.send_message_event(self.config["room_id"], EventType.ROOM_MESSAGE, core.thread_note(
+                root, "Code stimmt: freigegeben." if ok else "Falscher Code: abgelehnt."))
+        except Exception:
+            self.log.exception("could not confirm the code of %s", question.qid)
+        await self._end(question, f"Antwort: {question.label}" + (" (Code)" if ok else " (falscher Code)"))
+
     async def _end(self, question: core.Question, text: str) -> None:
         if not question.event_id:
             return
@@ -185,5 +224,4 @@ class SbxApproval(Plugin):
                 self.log.exception("expiry timer")
 
 
-def _html(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+_html = core.html_escape

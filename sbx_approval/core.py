@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import time
@@ -30,6 +31,14 @@ ANSWERS_MIN, ANSWERS_MAX = 2, 8
 TIMEOUT_MIN, TIMEOUT_MAX = 30, 3600
 OPEN_MAX = 50
 KEEP_DONE = 3600
+# The detail (a diff) goes into the thread message twice (body and formatted_body), and the encrypted event must stay
+# under Matrix's 65536 bytes (spec, "Size limits") after base64. THREAD_EVENT_MAX bounds the plaintext content.
+DETAIL_MAX = 16 * 1024
+THREAD_EVENT_MAX = 40 * 1024
+# The code the approver types for a strict question: lowercase letters and digits, easy on a phone keyboard, without
+# the look-alikes 0/o and 1/l. 32^6 is about 10^9 for one attempt.
+CODE_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+CODE_LEN = 6
 
 POLL_START = "org.matrix.msc3381.poll.start"
 POLL_RESPONSE = "org.matrix.msc3381.poll.response"
@@ -119,12 +128,21 @@ class Answer:
     token: str
 
 
+def make_code() -> str:
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+
+
 @dataclass
 class Question:
     qid: str
     text: str
     answers: list[Answer]
     expires: float
+    detail: str | None = None
+    # Strict: approval only by typing the code in the poll's thread; the poll offers only the refusal.
+    code: str | None = None
+    code_token: str | None = None
+    code_label: str | None = None
     event_id: str | None = None
     state: str = "open"  # open, answered, expired, closed
     token: str | None = None
@@ -151,13 +169,29 @@ class Questions:
             raise Refused(409, "id already used")
         if not isinstance(text, str) or not 1 <= len(text) <= TEXT_MAX:
             raise Refused(400, "bad question")
-        if not isinstance(answers, list) or not ANSWERS_MIN <= len(answers) <= ANSWERS_MAX:
-            raise Refused(400, "need 2 to 8 answers")
+        detail, strict = data.get("detail"), data.get("strict")
+        if detail is not None:
+            if not isinstance(detail, str) or not detail.strip():
+                raise Refused(400, "bad detail")
+            if len(detail.encode()) > DETAIL_MAX:
+                raise Refused(413, "detail too long")
+        strict_label = None
+        if strict is not None:
+            if not isinstance(strict, dict) or not isinstance(strict.get("token"), str) \
+                    or not TOKEN.fullmatch(strict["token"]):
+                raise Refused(400, "bad strict")
+            strict_label = strict.get("label", "Freigegeben")
+            if not isinstance(strict_label, str) or not 1 <= len(strict_label) <= LABEL_MAX:
+                raise Refused(400, "bad strict label")
+        least = 1 if strict is not None else ANSWERS_MIN
+        if not isinstance(answers, list) or not least <= len(answers) <= ANSWERS_MAX:
+            raise Refused(400, f"need {least} to {ANSWERS_MAX} answers")
         if not isinstance(timeout, int) or isinstance(timeout, bool) or not TIMEOUT_MIN <= timeout <= TIMEOUT_MAX:
             raise Refused(400, "bad timeout")
         if sum(1 for q in self.items.values() if q.state == "open") >= OPEN_MAX:
             raise Refused(429, "too many open questions")
-        parsed, labels, tokens = [], set(), set()
+        parsed, labels = [], set()
+        tokens = {strict["token"]} if strict is not None else set()
         for item in answers:
             label = item.get("label") if isinstance(item, dict) else None
             token = item.get("token") if isinstance(item, dict) else None
@@ -169,7 +203,14 @@ class Questions:
             tokens.add(token)
             # The poll's answer ids go to Matrix; the tokens never do.
             parsed.append(Answer(id=secrets.token_urlsafe(9), label=label, token=token))
-        question = Question(qid=qid, text=text, answers=parsed, expires=now + timeout)
+        question = Question(qid=qid, text=text, answers=parsed, expires=now + timeout, detail=detail)
+        if strict is not None:
+            question.code, question.code_token, question.code_label = make_code(), strict["token"], strict_label
+        if question.code or question.detail:
+            # Measured with a placeholder as long as any event id, because the check must come before the poll is sent.
+            size = len(json.dumps(thread_content(question, "$" + "x" * 64)).encode())
+            if size > THREAD_EVENT_MAX:
+                raise Refused(413, "detail too long for one Matrix event")
         self.items[qid] = question
         return question
 
@@ -193,6 +234,21 @@ class Questions:
             return None
         question.state, question.token, question.label, question.done_at = "answered", chosen.token, chosen.label, now
         return question
+
+    def code_reply(self, root: str | None, sender: str, text: str, approver: str,
+                   now: float) -> tuple[Question, bool] | None:
+        """A message of the approver in the thread of an open strict question: the one attempt. The right code answers
+        with the strict token; anything else is the refusal, so a wrong guess cannot be followed by a second one."""
+        question = self.items.get(self.by_event.get(root or "", ""))
+        if question is None or question.code is None or question.state != "open" or sender != approver:
+            return None
+        if now >= question.expires:
+            return None
+        ok = hmac.compare_digest(normalize_code(text).encode(), question.code.encode())
+        chosen_token, chosen_label = (question.code_token, question.code_label) if ok \
+            else (question.answers[0].token, question.answers[0].label)
+        question.state, question.token, question.label, question.done_at = "answered", chosen_token, chosen_label, now
+        return question, ok
 
     def close(self, qid: str, label: str | None, now: float) -> Question | None:
         """The caller got its answer on another channel: end the poll without a token."""
@@ -224,11 +280,19 @@ class Questions:
         return {"state": question.state}
 
 
+STRICT_HINT = "Freigeben nur mit dem Code im Thread."
+
+
+def poll_text(question: Question) -> str:
+    return f"{question.text}\n{STRICT_HINT}" if question.code else question.text
+
+
 def poll_start_content(question: Question) -> dict:
-    fallback = question.text + "\n" + "\n".join(f"{n}. {a.label}" for n, a in enumerate(question.answers, 1))
+    text = poll_text(question)
+    fallback = text + "\n" + "\n".join(f"{n}. {a.label}" for n, a in enumerate(question.answers, 1))
     return {
         POLL_START: {
-            "question": {TEXT: question.text, "body": question.text, "msgtype": "m.text"},
+            "question": {TEXT: text, "body": text, "msgtype": "m.text"},
             "kind": POLL_DISCLOSED,
             "max_selections": 1,
             "answers": [{"id": a.id, TEXT: a.label} for a in question.answers],
@@ -236,6 +300,49 @@ def poll_start_content(question: Question) -> dict:
         TEXT: fallback,
         "body": fallback,
     }
+
+
+def normalize_code(text: str) -> str:
+    """The last line that is not a quoted reply fallback, without blanks, lowercased: a phone capitalises the first
+    letter, and some clients still quote the replied-to message."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.lstrip().startswith(">")]
+    return "".join(lines[-1].split()).lower() if lines else ""
+
+
+def html_escape(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _in_thread(root: str) -> dict:
+    return {"rel_type": "m.thread", "event_id": root, "is_falling_back": True, "m.in_reply_to": {"event_id": root}}
+
+
+def thread_content(question: Question, root: str) -> dict:
+    """The message in the poll's thread: the detail as a code block, and for a strict question the code to type,
+    after the detail, so it is seen only by scrolling past it."""
+    body, html = [], []
+    if question.detail:
+        body.append(question.detail)
+        html.append(f"<pre><code>{html_escape(question.detail)}</code></pre>")
+    if question.code:
+        hint = "Eine andere Antwort hier gilt als Ablehnen. Es gibt nur einen Versuch."
+        body.append(f"Freigeben: antworte in diesem Thread mit {question.code}\n{hint}")
+        html.append(f"<p>Freigeben: antworte in diesem Thread mit <code>{question.code}</code><br>{hint}</p>")
+    return {"msgtype": "m.text", "body": "\n\n".join(body), "format": "org.matrix.custom.html",
+            "formatted_body": "".join(html), "m.relates_to": _in_thread(root)}
+
+
+def thread_note(root: str, text: str) -> dict:
+    return {"msgtype": "m.notice", "body": text, "m.relates_to": _in_thread(root)}
+
+
+def thread_root(content: dict) -> str | None:
+    """The thread a message belongs to, or None."""
+    relates = content.get("m.relates_to") or {}
+    if not isinstance(relates, dict) or relates.get("rel_type") != "m.thread":
+        return None
+    root = relates.get("event_id")
+    return root if isinstance(root, str) else None
 
 
 def poll_end_content(event_id: str, text: str) -> dict:

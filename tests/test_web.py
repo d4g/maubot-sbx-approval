@@ -160,3 +160,65 @@ async def test_full_path_signature_is_refused(setup):
     headers = core.sign_request(SECRET.encode(), "POST", PREFIX + "/ask", body)
     resp = await client.post(PREFIX + "/ask", data=body, headers=headers)
     assert resp.status == 401 and (await resp.json()) == {"error": "bad signature"}
+
+
+STRICT = {"id": "s1", "question": "Darf ha-config-apply laufen?", "detail": "alias: Test\nmode: single\n",
+          "answers": [{"label": "Ablehnen", "token": "a" * 20}], "strict": {"token": "d" * 20}}
+
+
+def thread_msg(body, root="$ev1", **kw):
+    return FakeEvent({"msgtype": "m.text", "body": body,
+                      "m.relates_to": {"rel_type": "m.thread", "event_id": root}}, **kw)
+
+
+async def test_strict_code_in_thread(setup):
+    plugin, client = setup
+    assert await call(client, "POST", "/ask", STRICT) == (201, {"id": "s1"}, True)
+    (_, kind1, poll), (_, kind2, thread) = plugin.client.sent
+    assert kind1 == core.POLL_START and kind2 == "m.room.message"
+    assert thread["m.relates_to"]["event_id"] == "$ev1" and "alias: Test" in thread["body"]
+    code = plugin.questions.items["s1"].code
+    assert code in thread["body"] and code not in json.dumps(poll)
+    assert "d" * 20 not in json.dumps(plugin.client.sent)
+
+    await plugin.on_message(thread_msg(code, sender="@other:example.org"))
+    await plugin.on_message(thread_msg(code, encrypted=False))
+    await plugin.on_message(thread_msg(code, root="$elsewhere"))
+    assert await call(client, "GET", "/answer/s1") == (200, {"state": "open"}, True)
+    await plugin.on_message(thread_msg(code.upper()))
+    assert await call(client, "GET", "/answer/s1") == (200, {"state": "answered", "token": "d" * 20}, True)
+    note, end = plugin.client.sent[-2][2], plugin.client.sent[-1]
+    assert note["body"] == "Code stimmt: freigegeben." and end[1] == core.POLL_END
+    assert end[2]["body"] == "Antwort: Freigegeben (Code)"
+
+
+async def test_strict_wrong_code(setup):
+    plugin, client = setup
+    await call(client, "POST", "/ask", STRICT)
+    await plugin.on_message(thread_msg("falsch"))
+    assert await call(client, "GET", "/answer/s1") == (200, {"state": "answered", "token": "a" * 20}, True)
+    assert plugin.client.sent[-1][2]["body"] == "Antwort: Ablehnen (falscher Code)"
+
+
+async def test_detail_without_strict_and_too_long(setup):
+    plugin, client = setup
+    assert (await call(client, "POST", "/ask", dict(QUESTION, detail="diff")))[0] == 201
+    assert plugin.client.sent[-1][2]["body"] == "diff"
+    status, body, signed = await call(client, "POST", "/ask", dict(STRICT, id="s9", detail="x" * (core.DETAIL_MAX + 1)))
+    assert (status, signed) == (413, False)
+
+
+async def test_thread_send_failure_ends_the_question(setup):
+    plugin, client = setup
+    sent = plugin.client.send_message_event
+
+    async def fail_thread(room_id, event_type, content):
+        if str(event_type) == "m.room.message":
+            raise RuntimeError("no")
+        return await sent(room_id, event_type, content)
+
+    plugin.client.send_message_event = fail_thread
+    status, body, signed = await call(client, "POST", "/ask", STRICT)
+    assert (status, body, signed) == (502, {"error": "could not send the thread"}, True)
+    assert plugin.questions.items["s1"].state == "closed"
+    assert plugin.client.sent[-1][1] == core.POLL_END

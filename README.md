@@ -32,7 +32,7 @@ an unsigned, wrongly signed, stale or replayed request gets `401` without a sign
 
 | Request | Body | Answer (signed) |
 |---|---|---|
-| `POST /ask` | `{"id", "question", "answers": [{"label", "token"}, …], "timeout"?}` — 2 to 8 answers, labels ≤ 40 characters, tokens 16 to 128 of `[A-Za-z0-9_-]`, timeout 30 to 3600 s (default from the config) | `201 {"id"}`; `409` id used, `429` 50 open questions, `502` poll not sent |
+| `POST /ask` | `{"id", "question", "answers": [{"label", "token"}, …], "timeout"?, "detail"?, "strict"?: {"token", "label"?}}` — 2 to 8 answers (1 to 8 with `strict`), labels ≤ 40 characters, tokens 16 to 128 of `[A-Za-z0-9_-]`, timeout 30 to 3600 s (default from the config), `detail` ≤ 16 KiB UTF-8 | `201 {"id"}`; `409` id used, `413` detail too long, `429` 50 open questions, `502` poll or thread not sent |
 | `GET /answer/<id>` | — | `200 {"state": "open" \| "expired" \| "closed"}` or `{"state": "answered", "token"}`; `404` unknown (also after a maubot restart: questions live in memory) |
 | `POST /close/<id>` | `{"label"?, "reason"?}` | `200 {"closed": bool}` — the caller got its answer elsewhere; the poll ends as "Beantwortet über das Telefon" (with the label), or with `"reason": "replaced"` as "Ersetzt durch eine neue Frage" |
 | `POST /link` | `{"text", "url"}` — `http(s)` only | `201 {"sent": true}` |
@@ -59,6 +59,23 @@ the reference.
 **Votes.** Only a poll response in the configured room, from the configured approver, sent encrypted, on an open
 question, counts, and only the first; the plugin then ends the poll with the chosen answer. An open question ends as
 "Abgelaufen, keine Antwort" after its timeout.
+
+**Detail in a thread.** With `detail` (e.g. the diff of a change), the plugin posts it as a code block in a thread
+on the poll (`rel_type: m.thread`), so the room's main timeline shows only the short poll. The whole thread message must
+stay under 40 KiB as plaintext, so the encrypted event stays under Matrix's 65536 bytes; a detail that HTML escaping
+blows up beyond that is refused with `413` before the poll is sent. If the thread message cannot be sent, the poll is
+ended as "Abgebrochen" and `/ask` answers `502`.
+
+**Strict questions** guard against approving by reflex, the way number matching does for MFA pushes. With `strict`,
+the plugin makes a code of 6 characters from lowercase letters and digits, without the look-alikes `0`, `o`, `1`
+and `l` (easy on a phone keyboard), and posts it in the thread **after** the detail. The poll carries only the
+answers given (normally just the refusal) and the line "Freigeben nur mit dem Code im Thread.". The approver approves by
+replying in the thread with the code; the plugin compares it without blanks and case (a phone capitalises the first
+letter) and ignores quoted reply-fallback lines. **There is one attempt:** any other reply of the approver in that
+thread counts as the first answer (the refusal), so a wrong code cannot be followed by a right one. A right code
+answers with `strict.token` and the label `strict.label` (default "Freigegeben"). The code is made in the plugin and
+reaches only the encrypted room; it never crosses the plain-HTTP link between caller and plugin. Thread replies count
+under the same rules as votes: configured room, configured approver, encrypted, open question.
 
 ## Configuration
 
