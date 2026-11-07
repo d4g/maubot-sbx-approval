@@ -1,0 +1,9 @@
+# The one room the plugin acts in (internal room ID, "!…:server"). Poll responses from any other room are ignored.
+room_id: ""
+# The only Matrix user whose vote counts, and only their first vote on a question.
+approver: ""
+# Shared secret with the caller, at least 32 characters. Never sent over the wire: requests and responses are
+# signed with HMAC-SHA256 over it. While it is empty or shorter, every request is refused.
+secret: ""
+# Seconds a question stays open when the caller does not say (30 to 3600).
+timeout: 900

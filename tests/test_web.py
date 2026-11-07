@@ -1,0 +1,135 @@
+"""The HTTP endpoints and the vote handler of the real plugin class, with a fake Matrix client.
+
+Needs maubot (skipped without it): uv run --no-project --python 3.13 --with maubot==0.6.0 --with pytest
+--with pytest-aiohttp pytest tests
+"""
+import asyncio
+import json
+import logging
+import pathlib
+import sys
+
+import pytest
+
+pytest.importorskip("maubot")
+from aiohttp import web  # noqa: E402
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import sbx_approval  # noqa: E402
+from sbx_approval import core  # noqa: E402
+
+SECRET = "s" * 40
+ROOM = "!room:example.org"
+APPROVER = "@dag:example.org"
+BOT = "@sbx:example.org"
+PREFIX = "/_matrix/maubot/plugin/sbx"
+
+
+class FakeClient:
+    mxid = BOT
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message_event(self, room_id, event_type, content):
+        self.sent.append((room_id, str(event_type), content))
+        return f"$ev{len(self.sent)}"
+
+    async def send_message(self, room_id, content):
+        self.sent.append((room_id, "m.room.message", content.serialize()))
+        return f"$ev{len(self.sent)}"
+
+
+class FakeEvent:
+    def __init__(self, content, sender=APPROVER, room_id=ROOM, encrypted=True):
+        self.content, self.sender, self.room_id = content, sender, room_id
+        self._mautrix = {"was_encrypted": True} if encrypted else None
+
+    def get(self, key):
+        return self._mautrix if key == "mautrix" else None
+
+
+def make_plugin():
+    plugin = object.__new__(sbx_approval.SbxApproval)
+    plugin.config = {"room_id": ROOM, "approver": APPROVER, "secret": SECRET, "timeout": 900}
+    plugin.client = FakeClient()
+    plugin.log = logging.getLogger("test")
+    plugin.questions = core.Questions()
+    plugin.nonces = core.Nonces()
+    plugin.lock = asyncio.Lock()
+    return plugin
+
+
+@pytest.fixture
+async def setup(aiohttp_client):
+    plugin = make_plugin()
+    app = web.Application()
+    sub = web.Application()
+    sub.router.add_post("/ask", plugin.ask)
+    sub.router.add_get("/answer/{qid}", plugin.answer)
+    sub.router.add_post("/close/{qid}", plugin.close)
+    sub.router.add_post("/link", plugin.link)
+    app.add_subapp(PREFIX, sub)
+    return plugin, await aiohttp_client(app)
+
+
+async def call(client, method, path, data=None, secret=SECRET):
+    body = json.dumps(data).encode() if data is not None else b""
+    headers = core.sign_request(secret.encode(), method, PREFIX + path, body)
+    resp = await client.request(method, PREFIX + path, data=body, headers=headers)
+    raw = await resp.read()
+    signed = core.check_response(SECRET.encode(), headers["X-Sbx-Nonce"], resp.status, raw,
+                                 resp.headers.get("X-Sbx-Mac", ""))
+    return resp.status, json.loads(raw), signed
+
+
+QUESTION = {"id": "q1", "question": "Darf ha-call laufen?",
+            "answers": [{"label": "Ablehnen", "token": "a" * 20}, {"label": "Einmal", "token": "b" * 20}]}
+
+
+async def test_ask_vote_answer(setup):
+    plugin, client = setup
+    assert await call(client, "POST", "/ask", QUESTION) == (201, {"id": "q1"}, True)
+    room, kind, content = plugin.client.sent[0]
+    assert (room, kind) == (ROOM, core.POLL_START)
+    assert "b" * 20 not in json.dumps(content)
+    assert await call(client, "GET", "/answer/q1") == (200, {"state": "open"}, True)
+
+    einmal = content[core.POLL_START]["answers"][1]["id"]
+    vote = {"m.relates_to": {"rel_type": "m.reference", "event_id": "$ev1"}, core.POLL_RESPONSE: {"answers": [einmal]}}
+    await plugin.on_response(FakeEvent(vote, sender="@other:example.org"))
+    await plugin.on_response(FakeEvent(vote, encrypted=False))
+    assert await call(client, "GET", "/answer/q1") == (200, {"state": "open"}, True)
+    await plugin.on_response(FakeEvent(vote))
+    assert await call(client, "GET", "/answer/q1") == (200, {"state": "answered", "token": "b" * 20}, True)
+    assert plugin.client.sent[-1][1] == core.POLL_END
+
+
+async def test_wrong_secret_and_replay(setup):
+    plugin, client = setup
+    status, body, signed = await call(client, "POST", "/ask", QUESTION, secret="x" * 40)
+    assert (status, body, signed) == (401, {"error": "bad signature"}, False)
+    assert plugin.client.sent == []
+    headers = core.sign_request(SECRET.encode(), "GET", PREFIX + "/answer/q1", b"")
+    first = await client.get(PREFIX + "/answer/q1", headers=headers)
+    second = await client.get(PREFIX + "/answer/q1", headers=headers)
+    assert first.status == 404 and second.status == 401
+
+
+async def test_close_and_link(setup):
+    plugin, client = setup
+    await call(client, "POST", "/ask", QUESTION)
+    assert await call(client, "POST", "/close/q1", {"label": "Einmal"}) == (200, {"closed": True}, True)
+    assert plugin.client.sent[-1][2]["body"] == "Beantwortet über das Telefon: Einmal"
+    assert await call(client, "GET", "/answer/q1") == (200, {"state": "closed"}, True)
+    status, _, signed = await call(client, "POST", "/link", {"text": "Bild <b>", "url": "https://x.example/p?a=1&b=2"})
+    assert (status, signed) == (201, True)
+    html = plugin.client.sent[-1][2]["formatted_body"]
+    assert "&lt;b&gt;" in html and "a=1&amp;b=2" in html
+
+
+async def test_no_secret(setup):
+    plugin, client = setup
+    plugin.config["secret"] = "short"
+    status, _, signed = await call(client, "POST", "/ask", QUESTION)
+    assert (status, signed) == (503, False)

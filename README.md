@@ -8,8 +8,9 @@ one random token per answer; the plugin starts a poll in the room, takes the **f
 ends the poll, and returns the token of the chosen answer. A question nobody answers ends as expired after a timeout.
 It can also post plain links (shared or published files) into the same room.
 
-**Status:** design only, no code yet. The design and the reasons behind it are recorded in the homelab repository's
-ADR 0024 ("Approvals and links of the agent sandbox through Matrix").
+**Status:** written and tested off-line (logic, and the HTTP endpoints of the real plugin class against maubot 0.6.0 /
+mautrix 0.21.1 with a fake Matrix client); not yet run in maubot. The design and the reasons behind it are recorded in
+the homelab repository's ADR 0024 ("Approvals and links of the agent sandbox through Matrix").
 
 ## Design in brief
 
@@ -23,6 +24,54 @@ ADR 0024 ("Approvals and links of the agent sandbox through Matrix").
 - **Signed with HMAC**, requests and responses, over a shared secret with timestamp and nonce. The secret never crosses
   the wire, so someone who can read the LAN traffic cannot forge an answer.
 - **Nothing site-specific in this repository.** Secret, room and user live in maubot's instance config.
+
+## API
+
+All under the instance's web path, `<maubot>/_matrix/maubot/plugin/<instance id>/`. Every request is signed (below);
+an unsigned, wrongly signed, stale or replayed request gets `401` without a signature, and `503` while no secret is set.
+
+| Request | Body | Answer (signed) |
+|---|---|---|
+| `POST /ask` | `{"id", "question", "answers": [{"label", "token"}, …], "timeout"?}` — 2 to 8 answers, labels ≤ 40 characters, tokens 16 to 128 of `[A-Za-z0-9_-]`, timeout 30 to 3600 s (default from the config) | `201 {"id"}`; `409` id used, `429` 50 open questions, `502` poll not sent |
+| `GET /answer/<id>` | — | `200 {"state": "open" \| "expired" \| "closed"}` or `{"state": "answered", "token"}`; `404` unknown (also after a maubot restart: questions live in memory) |
+| `POST /close/<id>` | `{"label"?}` | `200 {"closed": bool}` — the caller got its answer elsewhere; the poll ends as "Beantwortet über das Telefon" |
+| `POST /link` | `{"text", "url"}` — `http(s)` only | `201 {"sent": true}` |
+
+The answer tokens never reach Matrix: the poll gets random answer ids, and only the plugin maps them back.
+
+**Signature.** Headers `X-Sbx-Time` (Unix seconds), `X-Sbx-Nonce` (16 to 64 of `[A-Za-z0-9_-]`, fresh per request) and
+`X-Sbx-Mac`, the hex HMAC-SHA256 with the shared secret over these lines joined by `\n`:
+
+```text
+sbx-approval-request
+<METHOD>
+<full request path, e.g. /_matrix/maubot/plugin/sbx/answer/q1>
+<X-Sbx-Time>
+<X-Sbx-Nonce>
+<hex SHA-256 of the body>
+```
+
+Requests more than 60 s off the plugin's clock, or with a nonce seen in the last 120 s, are refused. A signed answer
+carries `X-Sbx-Mac` over `sbx-approval-response`, the request's nonce, the status code and the body's SHA-256, joined
+the same way; a caller must check it before it trusts the answer. `core.sign_request` and `core.check_response` are
+the reference.
+
+**Votes.** Only a poll response in the configured room, from the configured approver, sent encrypted, on an open
+question, counts, and only the first; the plugin then ends the poll with the chosen answer. An open question ends as
+"Abgelaufen, keine Antwort" after its timeout.
+
+## Configuration
+
+Per instance in the maubot UI ([`base-config.yaml`](base-config.yaml)): `room_id`, `approver`, `secret` (≥ 32
+characters), `timeout`. The bot account should run with autojoin off and be in that one room only.
+
+## Tests
+
+```bash
+uv run --no-project --python 3.13 --with maubot==0.6.0 --with pytest --with pytest-aiohttp pytest tests
+```
+
+`tests/test_core.py` needs only pytest; `tests/test_web.py` is skipped without maubot.
 
 ## Deployment
 
