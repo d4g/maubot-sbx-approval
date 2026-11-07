@@ -77,6 +77,13 @@ answers with `strict.token` and the label `strict.label` (default "Freigegeben")
 reaches only the encrypted room; it never crosses the plain-HTTP link between caller and plugin. Thread replies count
 under the same rules as votes: configured room, configured approver, encrypted, open question.
 
+*Encrypted* is checked on the server's copy of the reply: maubot hands message events to plugins as a new
+`MaubotMessageEvent` that copies only the attrs fields, so the `mautrix` marker (`was_encrypted`) set during decryption
+is lost (0.2.0 therefore refused every real reply). Since 0.2.1 the plugin fetches the reply with
+`GET /rooms/{room}/event/{event}`, counts it only if it is `m.room.encrypted` there, and uses the body and thread of its
+own decryption. A second decryption of one event passes mautrix's replay check (same event id and timestamp), and maubot
+leaves `ratchet_keys_on_decrypt` off. Every thread message that does not count is logged with the reason.
+
 ## Configuration
 
 Per instance in the maubot UI ([`base-config.yaml`](base-config.yaml)): `room_id`, `approver`, `secret` (≥ 32

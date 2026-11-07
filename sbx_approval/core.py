@@ -235,6 +235,20 @@ class Questions:
         question.state, question.token, question.label, question.done_at = "answered", chosen.token, chosen.label, now
         return question
 
+    def code_wait(self, root: str | None, now: float) -> str:
+        """Why a thread message under <root> cannot answer anything, or "" if a strict question waits for its code.
+        Only for the log and to skip fetching the event; code_reply decides."""
+        question = self.items.get(self.by_event.get(root or "", ""))
+        if question is None:
+            return "no question for that thread"
+        if question.code is None:
+            return f"question {question.qid} is not strict"
+        if question.state != "open":
+            return f"question {question.qid} is {question.state}"
+        if now >= question.expires:
+            return f"question {question.qid} has expired"
+        return ""
+
     def code_reply(self, root: str | None, sender: str, text: str, approver: str,
                    now: float) -> tuple[Question, bool] | None:
         """A message of the approver in the thread of an open strict question: the one attempt. The right code answers

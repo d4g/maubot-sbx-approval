@@ -8,12 +8,15 @@ import json
 import logging
 import pathlib
 import sys
+import urllib.parse
 
 import pytest
 
 pytest.importorskip("maubot")
 from aiohttp import web  # noqa: E402
+from maubot.matrix import MaubotMessageEvent  # noqa: E402
 from maubot.plugin_server import PluginWebApp, PrefixResource  # noqa: E402
+from mautrix.types import Event  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import sbx_approval  # noqa: E402
@@ -26,11 +29,35 @@ BOT = "@sbx:example.org"
 PREFIX = "/_matrix/maubot/plugin/sbx"
 
 
+class FakeApi:
+    """The homeserver's copy of events, as GET /rooms/{room}/event/{event} returns them."""
+
+    def __init__(self):
+        self.stored = {}
+
+    async def request(self, method, path, **kwargs):
+        event_id = urllib.parse.unquote(str(path).rsplit("/", 1)[-1])
+        return self.stored[event_id]
+
+
+class FakeCrypto:
+    """Decrypts what FakeApi stores as m.room.encrypted, from the plaintext the test put next to it."""
+
+    def __init__(self):
+        self.plain = {}
+
+    async def decrypt_megolm_event(self, evt):
+        return Event.deserialize(self.plain[evt.event_id])
+
+
 class FakeClient:
     mxid = BOT
+    disable_replies = False
 
     def __init__(self):
         self.sent = []
+        self.api = FakeApi()
+        self.crypto = FakeCrypto()
 
     async def send_message_event(self, room_id, event_type, content):
         self.sent.append((room_id, str(event_type), content))
@@ -166,9 +193,31 @@ STRICT = {"id": "s1", "question": "Darf ha-config-apply laufen?", "detail": "ali
           "answers": [{"label": "Ablehnen", "token": "a" * 20}], "strict": {"token": "d" * 20}}
 
 
-def thread_msg(body, root="$ev1", **kw):
-    return FakeEvent({"msgtype": "m.text", "body": body,
-                      "m.relates_to": {"rel_type": "m.thread", "event_id": root}}, **kw)
+_counter = iter(range(1, 10_000))
+
+
+def thread_msg(plugin, body, root="$ev1", sender=APPROVER, encrypted=True):
+    """A thread reply as maubot hands it to the plugin: a MaubotMessageEvent, which has lost the "mautrix" marker
+    of decrypt_megolm (the cause of the 2026-11-07 failure). The server's copy is m.room.encrypted or plain."""
+    event_id = f"$reply{next(_counter)}"
+    content = {"msgtype": "m.text", "body": body,
+               "m.relates_to": {"rel_type": "m.thread", "event_id": root, "is_falling_back": True,
+                                "m.in_reply_to": {"event_id": root}}}
+    plain = {"type": "m.room.message", "room_id": ROOM, "event_id": event_id, "sender": sender,
+             "origin_server_ts": 1, "content": content}
+    if encrypted:
+        plugin.client.api.stored[event_id] = dict(plain, type="m.room.encrypted", content={
+            "algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "x", "session_id": "s", "sender_key": "k",
+            "device_id": "DEV", "m.relates_to": {"rel_type": "m.thread", "event_id": root}})
+        plugin.client.crypto.plain[event_id] = plain
+    else:
+        plugin.client.api.stored[event_id] = plain
+    evt = Event.deserialize(plain)
+    if encrypted:
+        evt["mautrix"] = {"was_encrypted": True}
+    wrapped = MaubotMessageEvent(evt, plugin.client)
+    assert wrapped.get("mautrix") is None  # what maubot really hands over
+    return wrapped
 
 
 async def test_strict_code_in_thread(setup):
@@ -181,11 +230,11 @@ async def test_strict_code_in_thread(setup):
     assert code in thread["body"] and code not in json.dumps(poll)
     assert "d" * 20 not in json.dumps(plugin.client.sent)
 
-    await plugin.on_message(thread_msg(code, sender="@other:example.org"))
-    await plugin.on_message(thread_msg(code, encrypted=False))
-    await plugin.on_message(thread_msg(code, root="$elsewhere"))
+    await plugin.on_message(thread_msg(plugin, code, sender="@other:example.org"))
+    await plugin.on_message(thread_msg(plugin, code, encrypted=False))
+    await plugin.on_message(thread_msg(plugin, code, root="$elsewhere"))
     assert await call(client, "GET", "/answer/s1") == (200, {"state": "open"}, True)
-    await plugin.on_message(thread_msg(code.upper()))
+    await plugin.on_message(thread_msg(plugin, code.upper()))
     assert await call(client, "GET", "/answer/s1") == (200, {"state": "answered", "token": "d" * 20}, True)
     note, end = plugin.client.sent[-2][2], plugin.client.sent[-1]
     assert note["body"] == "Code stimmt: freigegeben." and end[1] == core.POLL_END
@@ -195,7 +244,7 @@ async def test_strict_code_in_thread(setup):
 async def test_strict_wrong_code(setup):
     plugin, client = setup
     await call(client, "POST", "/ask", STRICT)
-    await plugin.on_message(thread_msg("falsch"))
+    await plugin.on_message(thread_msg(plugin, "falsch"))
     assert await call(client, "GET", "/answer/s1") == (200, {"state": "answered", "token": "a" * 20}, True)
     assert plugin.client.sent[-1][2]["body"] == "Antwort: Ablehnen (falscher Code)"
 

@@ -8,7 +8,8 @@ import time
 from aiohttp.web import Request, Response
 from maubot import Plugin
 from maubot.handlers import event, web
-from mautrix.types import EventType, Format, MessageType, TextMessageEventContent
+from mautrix.api import Method, Path
+from mautrix.types import EncryptedEvent, Event, EventType, Format, MessageType, TextMessageEventContent
 from mautrix.util.config import BaseProxyConfig, ConfigUpdateHelper
 
 from . import core
@@ -179,10 +180,22 @@ class SbxApproval(Plugin):
         root = core.thread_root(content)
         if root is None:
             return
-        marker = evt.get("mautrix") or {}
-        if not marker.get("was_encrypted"):
-            self.log.warning("ignored an unencrypted thread message from %s", evt.sender)
+        if evt.sender != self.config["approver"]:
+            self.log.info("ignored a thread message from %s, not the approver", evt.sender)
             return
+        reason = self.questions.code_wait(root, time.time())
+        if reason:
+            self.log.info("ignored a thread message of the approver: %s", reason)
+            return
+        # maubot hands message events to plugins as a new MaubotMessageEvent that copies only the attrs fields, so the
+        # "mautrix" marker decrypt_megolm sets (was_encrypted, trust_state) is gone here (seen 2026-11-07). So fetch the
+        # event as stored on the server: it counts only if it is m.room.encrypted there, and then only its own
+        # decryption's body and thread count. A second decryption of the same event passes mautrix's replay check
+        # (same event id and timestamp), and maubot keeps ratchet_keys_on_decrypt off.
+        content = await self._decrypted_content(evt.room_id, evt.event_id)
+        if content is None:
+            return
+        root = core.thread_root(content)
         body = content.get("body")
         async with self.lock:
             result = self.questions.code_reply(root, evt.sender, body if isinstance(body, str) else "",
@@ -197,6 +210,24 @@ class SbxApproval(Plugin):
         except Exception:
             self.log.exception("could not confirm the code of %s", question.qid)
         await self._end(question, f"Antwort: {question.label}" + (" (Code)" if ok else " (falscher Code)"))
+
+    async def _decrypted_content(self, room_id: str, event_id: str) -> dict | None:
+        """The content of an event as decrypted from the server's copy, or None if it was not encrypted or fails."""
+        try:
+            raw = await self.client.api.request(Method.GET, Path.v3.rooms[room_id].event[event_id])
+            stored = Event.deserialize(raw)
+            if not isinstance(stored, EncryptedEvent):
+                self.log.warning("ignored an unencrypted thread message %s", event_id)
+                return None
+            if not self.client.crypto:
+                self.log.warning("no crypto in this client: cannot check thread message %s", event_id)
+                return None
+            decrypted = await self.client.crypto.decrypt_megolm_event(stored)
+        except Exception:
+            self.log.exception("could not fetch or decrypt thread message %s", event_id)
+            return None
+        content = decrypted.content
+        return content.serialize() if hasattr(content, "serialize") else dict(content)
 
     async def _end(self, question: core.Question, text: str) -> None:
         if not question.event_id:
